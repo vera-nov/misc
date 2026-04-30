@@ -1,11 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -15,298 +14,199 @@ from utils import (
     IMAGE_COL,
     REFERENCE_COL,
     ROW_ID_COL,
-    TARGET_COL,
     config_needs_green,
     config_needs_image,
+    json_dumps,
     normalize_input_dataframe,
     read_json,
-    run_module_function_in_process,
+    require_column,
     score_with_config,
     selected_english_metric_keys,
     selected_translators_and_kinds,
-    split_csv_arg,
+    write_json,
 )
-from translate_reports import DEFAULT_HY_MT_MODEL, DEFAULT_QWEN_MODEL, DEFAULT_TRANSLATEGEMMA_MODEL
-from calculate_english_text import DEFAULT_BIOVILT_MODEL, DEFAULT_CXRBERT_MODEL
-from calculate_russian_text import DEFAULT_MODEL as DEFAULT_GREEN_MODEL
 
 
-def merge_on_row_id(left: pd.DataFrame, right_path: str | Path, row_id_col: str = ROW_ID_COL) -> pd.DataFrame:
-    left = left.copy()
-    right = pd.read_csv(right_path, dtype={row_id_col: str})
-
-    if row_id_col not in left.columns:
-        raise ValueError(f"Left dataframe has no merge key column '{row_id_col}'.")
-    if row_id_col not in right.columns:
-        raise ValueError(f"Right dataframe '{right_path}' has no merge key column '{row_id_col}'.")
-
-    left[row_id_col] = left[row_id_col].astype(str)
-    right[row_id_col] = right[row_id_col].astype(str)
-
-    drop = [c for c in right.columns if c != row_id_col and c in left.columns]
-    if drop:
-        left = left.drop(columns=drop)
-
-    return left.merge(right, on=row_id_col, how="left")
+def merge_on_row_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
+    require_column(left, ROW_ID_COL)
+    require_column(right, ROW_ID_COL)
+    keep = [c for c in right.columns if c != ROW_ID_COL and c not in left.columns]
+    return left.merge(right[[ROW_ID_COL] + keep], on=ROW_ID_COL, how="left")
 
 
-def prepare_eval_csv(
-    input_csv: str,
-    tmp_path: str,
-    config: Dict[str, Any],
-    candidate_col: Optional[str],
-    reference_col: Optional[str],
-    image_col: Optional[str],
-    row_id_col: Optional[str],
-) -> tuple[pd.DataFrame, pd.DataFrame, Dict[str, Any]]:
+def prepare_eval_csv(input_csv: str, tmp_dir: Path) -> Tuple[Path, pd.DataFrame]:
     original = pd.read_csv(input_csv)
-    mapping = config.get("input_mapping", {})
-    normalized, new_mapping = normalize_input_dataframe(
-        original,
-        candidate_col=candidate_col or mapping.get("candidate_col_source"),
-        reference_col=reference_col or mapping.get("reference_col_source"),
-        image_col=image_col or mapping.get("image_col_source"),
-        target_col=None,
-        require_target=False,
-        row_id_col=row_id_col or mapping.get("row_id_col_source"),
-    )
-    normalized.to_csv(tmp_path, index=False)
-    return original, normalized, new_mapping
+    normalized = normalize_input_dataframe(original, require_target=False)
+    base_csv = tmp_dir / "base.csv"
+    normalized[[ROW_ID_COL, CANDIDATE_COL, REFERENCE_COL, IMAGE_COL]].to_csv(base_csv, index=False)
+    return base_csv, normalized
 
 
-def compute_required_features(
-    base_csv: str,
-    normalized_df: pd.DataFrame,
-    config: Dict[str, Any],
-    tmp_dir: str,
-    gpu: str,
-    device: str,
-    timeout: Optional[int],
-    image_root: Optional[str],
-    green_batch_size: int,
-    text_batch_size: int,
-    image_batch_size: int,
-    max_new_tokens_translation: int,
-    max_new_tokens_green: int,
-    verbose: bool,
-) -> pd.DataFrame:
-    tmp = Path(tmp_dir)
+def compute_required_features(args: argparse.Namespace, config: Dict[str, Any], base_csv: Path, tmp_dir: Path) -> pd.DataFrame:
+    from calculate_english_text import calculate_english_text_metrics_for_csv
+    from calculate_image_text import calculate_image_text_metrics_for_csv
+    from calculate_russian_text import calculate_green_for_csv
+    from translate_reports import translate_reports_for_csv
+
+    features = pd.read_csv(base_csv)[[ROW_ID_COL]].copy()
     translators, kinds = selected_translators_and_kinds(config)
-    feature_df = normalized_df[[ROW_ID_COL]].copy()
-    model_names = config.get("model_names", {})
-    qwen_model = model_names.get("qwen", DEFAULT_QWEN_MODEL)
-    hy_model = model_names.get("hy_mt", DEFAULT_HY_MT_MODEL)
-    gemma_model = model_names.get("translategemma", DEFAULT_TRANSLATEGEMMA_MODEL)
-    green_model = model_names.get("green", DEFAULT_GREEN_MODEL)
-    cxrbert_model = model_names.get("cxrbert", DEFAULT_CXRBERT_MODEL)
-    biovilt_model = model_names.get("biovilt", DEFAULT_BIOVILT_MODEL)
+    needs_english = bool(selected_english_metric_keys(config))
+    needs_image = config_needs_image(config)
 
-    translated_csv: Optional[Path] = None
-    if translators:
-        translation_csv = tmp / "translations.csv"
-        if verbose:
-            print("[evaluate] translations in isolated process", flush=True)
-        run_module_function_in_process(
-            "translate_reports",
-            "translate_reports_for_csv",
-            {
-                "input_csv": base_csv,
-                "output_csv": str(translation_csv),
-                "candidate_col": CANDIDATE_COL,
-                "reference_col": REFERENCE_COL,
-                "row_id_col": ROW_ID_COL,
-                "translators": translators,
-                "kinds": kinds,
-                "model_names": {"qwen": qwen_model, "hy_mt": hy_model, "translategemma": gemma_model},
-                "gpu": gpu,
-                "device": device,
-                "max_new_tokens": max_new_tokens_translation,
-            },
-            timeout=timeout,
+    translated = None
+    merged_for_english = None
+    if needs_english or needs_image:
+        translated_csv = tmp_dir / "translations.csv"
+        translated = translate_reports_for_csv(
+            input_csv=str(base_csv),
+            output_csv=str(translated_csv),
+            translators=translators,
+            translation_kinds=kinds,
+            qwen_model=config["models"].get("qwen_translator_model", "Qwen/Qwen2.5-7B-Instruct"),
+            hy_mt_model=config["models"].get("hy_mt_model", "tencent/HY-MT1.5-7B"),
+            translategemma_model=config["models"].get("translategemma_model", "google/translategemma-12b-it"),
+            max_new_tokens=args.translation_max_new_tokens,
+            device=args.device,
+            gpu=args.gpu,
+            per_translator_timeout=args.per_translator_timeout,
+            verbose=args.verbose,
         )
-        translated_df = merge_on_row_id(normalized_df, translation_csv, row_id_col=ROW_ID_COL)
-        translated_csv = tmp / "base_plus_translations.csv"
-        translated_df.to_csv(translated_csv, index=False)
+        base = pd.read_csv(base_csv)
+        merged_for_english = tmp_dir / "base_with_translations.csv"
+        merge_on_row_id(base, translated).to_csv(merged_for_english, index=False)
 
     if config_needs_green(config):
-        green_csv = tmp / "russian_green.csv"
-        if verbose:
-            print("[evaluate] Russian GREEN/Qwen in isolated process", flush=True)
-        run_module_function_in_process(
-            "calculate_russian_text",
-            "calculate_green_for_csv",
-            {
-                "input_csv": base_csv,
-                "output_csv": str(green_csv),
-                "candidate_col": CANDIDATE_COL,
-                "reference_col": REFERENCE_COL,
-                "row_id_col": ROW_ID_COL,
-                "model_name": green_model,
-                "batch_size": green_batch_size,
-                "gpu": gpu,
-                "device": device,
-                "max_new_tokens": max_new_tokens_green,
-            },
-            timeout=timeout,
+        green_csv = tmp_dir / "green.csv"
+        green = calculate_green_for_csv(
+            input_csv=str(base_csv),
+            output_csv=str(green_csv),
+            model_name=config["models"].get("green_model", "Qwen/Qwen2.5-7B-Instruct"),
+            batch_size=args.green_batch_size,
+            max_new_tokens=args.green_max_new_tokens,
+            device=args.device,
+            gpu=args.gpu,
+            verbose=args.verbose,
         )
-        feature_df = merge_on_row_id(feature_df, green_csv)
+        features = merge_on_row_id(features, green)
 
-    english_methods = selected_english_metric_keys(config)
-    if english_methods:
-        if translated_csv is None:
-            raise RuntimeError("Config needs English text metrics, but no translators were selected.")
-        text_csv = tmp / "english_text_metrics.csv"
-        if verbose:
-            print("[evaluate] English text metrics in isolated process", flush=True)
-        run_module_function_in_process(
-            "calculate_english_text",
-            "calculate_english_text_metrics_for_csv",
-            {
-                "input_csv": str(translated_csv),
-                "output_csv": str(text_csv),
-                "row_id_col": ROW_ID_COL,
-                "translators": translators,
-                "kinds": kinds,
-                "methods": english_methods,
-                "cxrbert_model": cxrbert_model,
-                "biovilt_model": biovilt_model,
-                "batch_size": text_batch_size,
-                "gpu": gpu,
-                "device": device,
-            },
-            timeout=timeout,
+    if needs_english:
+        english_csv = tmp_dir / "english.csv"
+        english = calculate_english_text_metrics_for_csv(
+            input_csv=str(merged_for_english),
+            output_csv=str(english_csv),
+            translators=translators,
+            translation_kinds=kinds,
+            methods=selected_english_metric_keys(config),
+            cxrbert_model=config["models"].get("cxrbert_model", "microsoft/BiomedVLP-CXR-BERT-specialized"),
+            biovilt_model=config["models"].get("biovilt_model", "microsoft/BiomedVLP-BioViL-T"),
+            batch_size=args.text_batch_size,
+            device=args.device,
+            gpu=args.gpu,
+            verbose=args.verbose,
         )
-        feature_df = merge_on_row_id(feature_df, text_csv)
+        features = merge_on_row_id(features, english)
 
-    if config_needs_image(config):
-        if translated_csv is None:
-            raise RuntimeError("Config needs image-text metric, but no translators were selected.")
-        image_csv = tmp / "image_text_metrics.csv"
-        if verbose:
-            print("[evaluate] BioViL-T image-text metric in isolated process", flush=True)
-        run_module_function_in_process(
-            "calculate_image_text",
-            "calculate_image_text_metrics_for_csv",
-            {
-                "input_csv": str(translated_csv),
-                "output_csv": str(image_csv),
-                "image_col": IMAGE_COL,
-                "row_id_col": ROW_ID_COL,
-                "translators": translators,
-                "kinds": kinds,
-                "image_root": image_root,
-                "biovilt_model": biovilt_model,
-                "batch_size": image_batch_size,
-                "gpu": gpu,
-                "device": device,
-            },
-            timeout=timeout,
+    if needs_image:
+        image_csv = tmp_dir / "image.csv"
+        image = calculate_image_text_metrics_for_csv(
+            input_csv=str(merged_for_english),
+            output_csv=str(image_csv),
+            translators=translators,
+            translation_kinds=kinds,
+            image_root=args.image_root,
+            biovilt_model=config["models"].get("biovilt_model", "microsoft/BiomedVLP-BioViL-T"),
+            batch_size=args.image_batch_size,
+            device=args.device,
+            gpu=args.gpu,
+            verbose=args.verbose,
         )
-        feature_df = merge_on_row_id(feature_df, image_csv)
+        features = merge_on_row_id(features, image)
 
-    return feature_df
+    return features
 
 
-def save_output(output_path: str | Path, original_df: pd.DataFrame, result_df: pd.DataFrame, summary: Dict[str, Any]) -> None:
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    suffix = output_path.suffix.lower()
-    if suffix == ".json":
-        payload = {"summary": summary, "rows": result_df.to_dict(orient="records")}
-        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    elif suffix == ".jsonl":
-        with output_path.open("w", encoding="utf-8") as f:
-            f.write(json.dumps({"summary": summary}, ensure_ascii=False) + "\n")
-            for rec in result_df.to_dict(orient="records"):
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-    else:
-        # Single output file: add summary as constant columns.
-        out = result_df.copy()
-        out["quality_score_mean"] = summary["quality_score_mean"]
-        out["quality_score_std"] = summary["quality_score_std"]
-        out.to_csv(output_path, index=False)
+def to_json_scalar(value: Any) -> Any:
+    if pd.isna(value):
+        return None
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    return value
+
+
+def build_output(normalized: pd.DataFrame, features: pd.DataFrame, config: Dict[str, Any], scores: np.ndarray) -> Dict[str, Any]:
+    merged = merge_on_row_id(normalized, features)
+    selected = config["selected_features"]
+    weights = config["weights"]
+    entries: List[Dict[str, Any]] = []
+
+    for i, row in merged.iterrows():
+        metrics = []
+        for spec, weight in zip(selected, weights):
+            col = spec["feature_col"]
+            metrics.append(
+                {
+                    "method_key": spec["method_key"],
+                    "feature_col": col,
+                    "translator": spec.get("translator"),
+                    "translation_kind": spec.get("kind"),
+                    "weight": float(weight),
+                    "value": to_json_scalar(row.get(col)),
+                }
+            )
+        entries.append(
+            {
+                CANDIDATE_COL: to_json_scalar(row[CANDIDATE_COL]),
+                REFERENCE_COL: to_json_scalar(row[REFERENCE_COL]),
+                IMAGE_COL: to_json_scalar(row[IMAGE_COL]),
+                "quality_score": to_json_scalar(scores[i]),
+                "metrics": metrics,
+                "GREEN_analysis": to_json_scalar(row.get("ru_GREEN_Qwen_analysis")),
+                "GREEN_errors_json": to_json_scalar(row.get("ru_GREEN_Qwen_errors_json")),
+            }
+        )
+
+    return {
+        "summary": {
+            "quality_score_mean": float(np.nanmean(scores)) if len(scores) else None,
+            "quality_score_std": float(np.nanstd(scores, ddof=1)) if len(scores) > 1 else 0.0,
+        },
+        "entry-wise": entries,
+    }
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Evaluate reports using saved radiology quality ensemble config.")
-    p.add_argument("--config", required=True, help="Path to config JSON produced by build_method.py")
-    p.add_argument("--path-to-data-description-for-evaluation", "--path_to_data_description_for_evaluation", dest="input_csv", required=True)
-    p.add_argument("--output", required=True)
-    p.add_argument("--candidate-col", required=True)
-    p.add_argument("--reference-col", required=True)
-    p.add_argument("--image-col", required=True)
-    p.add_argument("--row-id-col", default=None)
-    p.add_argument("--gpu", default="0")
-    p.add_argument("--device", choices=["cuda", "cpu", "auto"], default="cuda")
-    p.add_argument("--timeout", type=int, default=None)
-    p.add_argument("--image-root", default=None, help="Root for relative image paths. Default: config image_root or input CSV directory.")
-    p.add_argument("--green-batch-size", type=int, default=1)
-    p.add_argument("--text-batch-size", type=int, default=16)
-    p.add_argument("--image-batch-size", type=int, default=8)
-    p.add_argument("--max-new-tokens-translation", type=int, default=256)
-    p.add_argument("--max-new-tokens-green", type=int, default=768)
-    p.add_argument("--verbose", action="store_true")
-    return p.parse_args()
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--path-to-data-description-for-evaluation", required=True)
+    parser.add_argument("--output", default="quality_scores.json")
+    parser.add_argument("--gpu", type=int, default=None)
+    parser.add_argument("--device", default=None)
+    parser.add_argument("--per-translator-timeout", type=int, default=3600)
+    parser.add_argument("--image-root", default=None)
+    parser.add_argument("--translation-max-new-tokens", type=int, default=256)
+    parser.add_argument("--green-batch-size", type=int, default=1)
+    parser.add_argument("--green-max-new-tokens", type=int, default=512)
+    parser.add_argument("--text-batch-size", type=int, default=16)
+    parser.add_argument("--image-batch-size", type=int, default=16)
+    parser.add_argument("--verbose", action="store_true")
+    return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
+    project_dir = Path(__file__).resolve().parent
+    os.environ["PYTHONPATH"] = str(project_dir) + os.pathsep + os.environ.get("PYTHONPATH", "")
     config = read_json(args.config)
-    input_csv = Path(args.input_csv).expanduser().resolve()
-    if not input_csv.exists():
-        raise FileNotFoundError(input_csv)
-    os.environ["PYTHONPATH"] = str(Path(__file__).resolve().parent) + os.pathsep + os.environ.get("PYTHONPATH", "")
-    image_root = args.image_root or config.get("image_root") or str(input_csv.parent)
 
-    with tempfile.TemporaryDirectory(prefix="radiology_quality_eval_") as td:
-        base_csv = str(Path(td) / "base.csv")
-        original_df, normalized_df, mapping = prepare_eval_csv(
-            str(input_csv),
-            base_csv,
-            config,
-            args.candidate_col,
-            args.reference_col,
-            args.image_col,
-            args.row_id_col,
-        )
-        feature_df = compute_required_features(
-            base_csv=base_csv,
-            normalized_df=normalized_df,
-            config=config,
-            tmp_dir=td,
-            gpu=args.gpu,
-            device=args.device,
-            timeout=args.timeout,
-            image_root=image_root,
-            green_batch_size=args.green_batch_size,
-            text_batch_size=args.text_batch_size,
-            image_batch_size=args.image_batch_size,
-            max_new_tokens_translation=args.max_new_tokens_translation,
-            max_new_tokens_green=args.max_new_tokens_green,
-            verbose=args.verbose,
-        )
-        scores = score_with_config(feature_df, config)
-        selected_cols = [s["feature_col"] for s in config["selected_features"]]
-        result = normalized_df.copy()
-        for col in selected_cols:
-            if col in feature_df.columns:
-                result[col] = feature_df[col]
-        result["quality_score"] = scores
-        # Add explainable error list if selected / available.
-        for spec in config.get("selected_features", []):
-            errors_col = spec.get("errors_col")
-            if errors_col and errors_col in feature_df.columns:
-                result["llm_errors_json"] = feature_df[errors_col]
-        summary = {
-            "n_rows": int(len(result)),
-            "quality_score_mean": float(np.nanmean(scores)),
-            "quality_score_std": float(np.nanstd(scores, ddof=1)) if len(scores) > 1 else 0.0,
-            "selected_features": config["selected_features"],
-            "weights": config["weights"],
-            "input_mapping_used": mapping,
-        }
-        save_output(args.output, original_df, result, summary)
-    print(f"Saved evaluation: {Path(args.output).expanduser().resolve()}")
+    with tempfile.TemporaryDirectory(prefix="metric_eval_") as d:
+        tmp_dir = Path(d)
+        base_csv, normalized = prepare_eval_csv(args.path_to_data_description_for_evaluation, tmp_dir)
+        features = compute_required_features(args, config, base_csv, tmp_dir)
+        scores = score_with_config(features, config)
+        payload = build_output(normalized, features, config, scores)
+
+    write_json(args.output, payload)
+    print(json_dumps(payload["summary"]))
 
 
 if __name__ == "__main__":

@@ -195,28 +195,21 @@ def read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
 
-def split_csv_arg(x: Optional[str], default: Sequence[str]) -> List[str]:
+def split_csv_arg(x: Optional[str], default: Optional[Sequence[str]] = None) -> List[str]:
     if x is None or str(x).strip() == "":
-        return list(default)
+        return list(default or [])
     return [v.strip() for v in str(x).split(",") if v.strip()]
 
-def require_column(df: pd.DataFrame, col: Optional[str], arg_name: str) -> str:
+def require_column(df: pd.DataFrame, col: Optional[str], arg_name: Optional[str] = None) -> str:
     if col is None or str(col).strip() == "":
-        raise ValueError(
-            f"Argument '{arg_name}' is required. "
-            f"Available columns: {list(df.columns)}"
-        )
-
+        name = arg_name or "column"
+        raise ValueError(f"Argument '{name}' is required. Available columns: {list(df.columns)}")
     col = str(col).strip()
-
     if col not in df.columns:
-        raise ValueError(
-            f"Column passed via '{arg_name}' was not found: '{col}'. "
-            f"Available columns: {list(df.columns)}"
-        )
-
+        if arg_name:
+            raise ValueError(f"Column passed via '{arg_name}' was not found: '{col}'. Available columns: {list(df.columns)}")
+        raise ValueError(f"Missing required column: {col}. Available columns: {list(df.columns)}")
     return col
-
 
 def normalize_input_dataframe(
     df: pd.DataFrame,
