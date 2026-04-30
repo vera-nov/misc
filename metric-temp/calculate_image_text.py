@@ -83,8 +83,7 @@ def encode_biovilt_text(texts: Sequence[str], tokenizer: Any, model: Any, batch_
 
 def encode_biovilt_images(paths: Sequence[str], device: Optional[str]) -> np.ndarray:
     import torch
-    from health_multimodal.image import get_image_inference
-    from health_multimodal.image.model.pretrained import ImageModelType
+    from health_multimodal.image.utils import ImageModelType, get_image_inference
 
     engine = get_image_inference(ImageModelType.BIOVIL_T)
     actual_device = get_input_device(device)

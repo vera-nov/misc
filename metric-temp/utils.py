@@ -212,6 +212,7 @@ def require_column(df: pd.DataFrame, col: Optional[str], arg_name: Optional[str]
         raise ValueError(f"Missing required column: {col}. Available columns: {list(df.columns)}")
     return col
 
+
 def normalize_input_dataframe(
     df: pd.DataFrame,
     candidate_col: str,
@@ -273,6 +274,7 @@ def normalize_input_dataframe(
 
     return work, mapping
 
+
 def pick_dtype(torch_module: Any = None) -> Any:
     if torch_module is None:
         import torch as torch_module
@@ -294,6 +296,7 @@ def get_input_device(device: Optional[str] = None) -> str:
         return "cuda" if torch.cuda.is_available() else "cpu"
     except Exception:
         return "cpu"
+
 
 def cleanup_cuda(*objects: Any) -> None:
     for obj in objects:
@@ -318,6 +321,7 @@ def configure_worker_environment(gpu: Optional[int] = None, device: Optional[str
     os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
     if gpu is not None and (device is None or str(device).startswith("cuda") or str(device) == "auto"):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
+
 
 def _process_entry(module_name: str, function_name: str, kwargs: Dict[str, Any], queue: Any) -> None:
     try:
@@ -370,24 +374,50 @@ def safe_kendall_tau(x: Sequence[float], y: Sequence[float]) -> float:
     return float(tau)
 
 
-def build_weight_grid(n_features: int, step: float) -> np.ndarray:
+def build_weight_grid(
+    n_features: int,
+    step: float,
+    required_nonzero_indices: Optional[Sequence[int]] = [0, 2],
+) -> np.ndarray:
     if n_features < 1:
         raise ValueError("n_features must be >= 1")
     if step <= 0 or step > 1:
         raise ValueError("weight_step must be in (0, 1].")
+
     inv = round(1.0 / step)
     if not math.isclose(inv * step, 1.0, rel_tol=1e-9, abs_tol=1e-9):
         raise ValueError("weight_step must evenly divide 1.0, e.g. 0.1, 0.05, 0.01")
+
+    required_nonzero_indices = list(required_nonzero_indices or [])
+
+    for idx in required_nonzero_indices:
+        if idx < 0 or idx >= n_features:
+            raise ValueError(f"required_nonzero index {idx} is out of range for {n_features} features")
+    min_units = [0] * n_features
+    for idx in required_nonzero_indices:
+        min_units[idx] = 1
+
+    min_sum = sum(min_units)
+    if min_sum > inv:
+        raise ValueError(
+            f"Impossible constraints: {len(required_nonzero_indices)} required nonzero weights "
+            f"with step={step} need at least {min_sum * step}, but total weight is 1.0"
+        )
+
     rows: List[List[float]] = []
+    remaining_total = inv - min_sum
 
     def rec(prefix: List[int], remaining: int, k_left: int) -> None:
         if k_left == 1:
-            rows.append([(v * step) for v in prefix + [remaining]])
+            units = prefix + [remaining]
+            full_units = [u + m for u, m in zip(units, min_units)]
+            rows.append([v * step for v in full_units])
             return
+
         for v in range(remaining + 1):
             rec(prefix + [v], remaining - v, k_left - 1)
 
-    rec([], inv, n_features)
+    rec([], remaining_total, n_features)
     return np.asarray(rows, dtype=float)
 
 

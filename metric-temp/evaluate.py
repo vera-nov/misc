@@ -30,6 +30,10 @@ from utils import (
 def merge_on_row_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     require_column(left, ROW_ID_COL)
     require_column(right, ROW_ID_COL)
+    left = left.copy()
+    right = right.copy()
+    left[ROW_ID_COL] = left[ROW_ID_COL].astype(str)
+    right[ROW_ID_COL] = right[ROW_ID_COL].astype(str)
     keep = [c for c in right.columns if c != ROW_ID_COL and c not in left.columns]
     return left.merge(right[[ROW_ID_COL] + keep], on=ROW_ID_COL, how="left")
 
