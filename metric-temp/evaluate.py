@@ -4,7 +4,7 @@ import argparse
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -34,9 +34,29 @@ def merge_on_row_id(left: pd.DataFrame, right: pd.DataFrame) -> pd.DataFrame:
     return left.merge(right[[ROW_ID_COL] + keep], on=ROW_ID_COL, how="left")
 
 
-def prepare_eval_csv(input_csv: str, tmp_dir: Path) -> Tuple[Path, pd.DataFrame]:
+def source_columns_from_config(config: Dict[str, Any]) -> Dict[str, str]:
+    columns = config.get("columns") or {}
+    required = ["candidate_col_source", "reference_col_source", "image_col_source"]
+    missing = [k for k in required if not columns.get(k)]
+    if missing:
+        raise ValueError(f"Config does not contain source column names: {missing}")
+    return {
+        "candidate": columns["candidate_col_source"],
+        "reference": columns["reference_col_source"],
+        "image": columns["image_col_source"],
+    }
+
+
+def prepare_eval_csv(input_csv: str, tmp_dir: Path, config: Dict[str, Any]) -> Tuple[Path, pd.DataFrame]:
     original = pd.read_csv(input_csv)
-    normalized = normalize_input_dataframe(original, require_target=False)
+    columns = source_columns_from_config(config)
+    normalized, _ = normalize_input_dataframe(
+        original,
+        candidate_col=columns["candidate"],
+        reference_col=columns["reference"],
+        image_col=columns["image"],
+        require_target=False,
+    )
     base_csv = tmp_dir / "base.csv"
     normalized[[ROW_ID_COL, CANDIDATE_COL, REFERENCE_COL, IMAGE_COL]].to_csv(base_csv, index=False)
     return base_csv, normalized
@@ -53,7 +73,6 @@ def compute_required_features(args: argparse.Namespace, config: Dict[str, Any], 
     needs_english = bool(selected_english_metric_keys(config))
     needs_image = config_needs_image(config)
 
-    translated = None
     merged_for_english = None
     if needs_english or needs_image:
         translated_csv = tmp_dir / "translations.csv"
@@ -200,7 +219,7 @@ def main() -> None:
 
     with tempfile.TemporaryDirectory(prefix="metric_eval_") as d:
         tmp_dir = Path(d)
-        base_csv, normalized = prepare_eval_csv(args.path_to_data_description_for_evaluation, tmp_dir)
+        base_csv, normalized = prepare_eval_csv(args.path_to_data_description_for_evaluation, tmp_dir, config)
         features = compute_required_features(args, config, base_csv, tmp_dir)
         scores = score_with_config(features, config)
         payload = build_output(normalized, features, config, scores)

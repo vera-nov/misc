@@ -211,12 +211,7 @@ def main() -> None:
     }
 
     u.write_json(args.output_json, payload)
-    print(u.json_dumps({
-        "output_json": args.output_json,
-        "cv": final["training"],
-        "selected_features": final["selected_features"],
-        "weights": final["weights"],
-    }))
+    print(u.json_dumps({"output_json": args.output_json, "cv": final["training"], "selected_features": final["selected_features"], "weights": final["weights"]}))
 
 
 if __name__ == "__main__":

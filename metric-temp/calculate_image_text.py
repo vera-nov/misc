@@ -67,6 +67,7 @@ def encode_biovilt_text(texts: Sequence[str], tokenizer: Any, model: Any, batch_
     embs = []
     for start in range(0, len(texts), batch_size):
         batch = tokenizer(list(texts[start : start + batch_size]), padding=True, truncation=True, max_length=512, return_tensors="pt")
+        batch.pop("token_type_ids", None)
         batch = {k: v.to(model.device) for k, v in batch.items()}
         with torch.inference_mode():
             if hasattr(model, "get_projected_text_embeddings"):

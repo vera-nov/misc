@@ -120,14 +120,21 @@ def text_embeddings(texts: Sequence[str], tokenizer: Any, model: Any, biovilt: b
     for start in range(0, len(texts), batch_size):
         batch_texts = list(texts[start : start + batch_size])
         batch = tokenizer(batch_texts, padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+
+        if biovilt:
+            batch.pop("token_type_ids", None)
+
         batch = {k: v.to(model.device) for k, v in batch.items()}
+
         with torch.inference_mode():
             if biovilt and hasattr(model, "get_projected_text_embeddings"):
                 emb = model.get_projected_text_embeddings(**batch)
             else:
                 emb = hidden(model(**batch, return_dict=True))[:, 0, :]
-            emb = F.normalize(emb, dim=-1)
+
+        emb = F.normalize(emb, dim=-1)
         all_embs.append(emb.detach().cpu().numpy())
+
     cleanup_cuda()
     return np.concatenate(all_embs, axis=0) if all_embs else np.zeros((0, 1), dtype=np.float32)
 
@@ -146,6 +153,10 @@ def bertscore_f1(cands: Sequence[str], refs: Sequence[str], tokenizer: Any, mode
     for start in range(0, len(cands), batch_size):
         cand_batch = tokenizer(list(cands[start : start + batch_size]), padding=True, truncation=True, max_length=max_length, return_tensors="pt")
         ref_batch = tokenizer(list(refs[start : start + batch_size]), padding=True, truncation=True, max_length=max_length, return_tensors="pt")
+
+        cand_batch.pop("token_type_ids", None)
+        ref_batch.pop("token_type_ids", None)
+
         cand_batch = {k: v.to(model.device) for k, v in cand_batch.items()}
         ref_batch = {k: v.to(model.device) for k, v in ref_batch.items()}
         with torch.inference_mode():

@@ -208,6 +208,7 @@ def translate_with_hy_mt(texts: Sequence[str], model_name: str, use_terminology:
             continue
         prompt = build_hy_prompt(src, "English", use_terminology)
         batch = tokenizer(prompt, return_tensors="pt", truncation=True)
+        batch.pop("token_type_ids", None)
         batch = {k: v.to(model.device) for k, v in batch.items()}
         with torch.inference_mode():
             generated = model.generate(

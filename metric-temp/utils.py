@@ -200,6 +200,7 @@ def split_csv_arg(x: Optional[str], default: Optional[Sequence[str]] = None) -> 
         return list(default or [])
     return [v.strip() for v in str(x).split(",") if v.strip()]
 
+
 def require_column(df: pd.DataFrame, col: Optional[str], arg_name: Optional[str] = None) -> str:
     if col is None or str(col).strip() == "":
         name = arg_name or "column"
@@ -272,7 +273,9 @@ def normalize_input_dataframe(
 
     return work, mapping
 
-def pick_dtype(torch_module: Any) -> Any:
+def pick_dtype(torch_module: Any = None) -> Any:
+    if torch_module is None:
+        import torch as torch_module
     if torch_module.cuda.is_available():
         try:
             if torch_module.cuda.is_bf16_supported():
@@ -283,9 +286,14 @@ def pick_dtype(torch_module: Any) -> Any:
     return torch_module.float32
 
 
-def get_input_device(model: Any) -> Any:
-    return next(model.parameters()).device
-
+def get_input_device(device: Optional[str] = None) -> str:
+    if device:
+        return str(device)
+    try:
+        import torch
+        return "cuda" if torch.cuda.is_available() else "cpu"
+    except Exception:
+        return "cpu"
 
 def cleanup_cuda(*objects: Any) -> None:
     for obj in objects:
@@ -304,13 +312,12 @@ def cleanup_cuda(*objects: Any) -> None:
         pass
 
 
-def configure_worker_environment(gpu: str = "0", device: str = "cuda") -> None:
+def configure_worker_environment(gpu: Optional[int] = None, device: Optional[str] = None) -> None:
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     os.environ.setdefault("HF_XET_HIGH_PERFORMANCE", "1")
-    os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-    if device in {"cuda", "auto"}:
+    os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+    if gpu is not None and (device is None or str(device).startswith("cuda") or str(device) == "auto"):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu)
-
 
 def _process_entry(module_name: str, function_name: str, kwargs: Dict[str, Any], queue: Any) -> None:
     try:
@@ -552,7 +559,6 @@ def select_and_fit_final_config(
             "n_test": int(len(test_df)),
         })
 
-    # Final model selection on all data using KFold validation, then fit weights on all complete rows.
     full_cv = KFold(n_splits=k_inner, shuffle=True, random_state=random_state + 10_000)
     final_scored: List[Tuple[float, float, str, CandidateConfig, List[float]]] = []
     for cfg in candidates:
@@ -596,8 +602,9 @@ def select_and_fit_final_config(
 def score_with_config(feature_df: pd.DataFrame, config: Dict[str, Any]) -> np.ndarray:
     specs = [FeatureSpec(**s) for s in config["selected_features"]]
     x = _quality_feature_matrix(feature_df, specs)
-    means = np.asarray(config["standardizer"]["means"], dtype=float)
-    stds = np.asarray(config["standardizer"]["stds"], dtype=float)
+    standardizer = config.get("standardizer") or config.get("standardization")
+    means = np.asarray(standardizer["means"], dtype=float)
+    stds = np.asarray(standardizer["stds"], dtype=float)
     weights = np.asarray(config["weights"], dtype=float)
     return _transform(x, means, stds) @ weights
 
