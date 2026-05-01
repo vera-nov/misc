@@ -422,6 +422,9 @@ def build_weight_grid(
 
 
 def feature_specs_from_registry(translators: Sequence[str], kinds: Sequence[str]) -> Tuple[List[FeatureSpec], List[FeatureSpec], List[FeatureSpec]]:
+    """
+    create FeatureSpec objects from BASIC_METHODS
+    """
     ru: List[FeatureSpec] = []
     text: List[FeatureSpec] = []
     image: List[FeatureSpec] = []
@@ -454,7 +457,13 @@ def feature_specs_from_registry(translators: Sequence[str], kinds: Sequence[str]
     return ru, text, image
 
 
-def make_candidate_configs(available_cols: Iterable[str], translators: Sequence[str], kinds: Sequence[str]) -> List[CandidateConfig]:
+def make_candidate_configs(
+        available_cols: Iterable[str],
+        translators: Sequence[str],
+        kinds: Sequence[str]) -> List[CandidateConfig]:
+    """
+    create all available basic method configurations
+    """
     cols = set(available_cols)
     ru_specs, text_specs, image_specs = feature_specs_from_registry(translators, kinds)
     ru_specs = [s for s in ru_specs if s.feature_col in cols]
