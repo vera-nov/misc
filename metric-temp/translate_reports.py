@@ -302,6 +302,31 @@ def _model_name_for_key(key: str, qwen_model: str, hy_mt_model: str, translatege
     }[key]
 
 
+def _empty_translation_indices(texts: Sequence[str], outputs: Sequence[str]) -> List[int]:
+    return [
+        i
+        for i, (src, out) in enumerate(zip(texts, outputs))
+        if normalize_source_text(src) and not normalize_source_text(out)
+    ]
+
+
+def _run_translator(
+    texts: Sequence[str],
+    translator: str,
+    model_name: str,
+    use_terminology: bool,
+    max_new_tokens: int,
+    device: Optional[str],
+    label: str,
+) -> List[str]:
+    outputs = TRANSLATOR_REGISTRY[translator](texts, model_name, use_terminology, max_new_tokens, device)
+    if len(outputs) != len(texts):
+        raise ValueError(
+            f"Translator {translator} returned {len(outputs)} translations for {len(texts)} inputs in {label}"
+        )
+    return list(outputs)
+
+
 def _translate_pair_lists(
     texts: Sequence[str],
     translator: str,
@@ -309,8 +334,52 @@ def _translate_pair_lists(
     use_terminology: bool,
     max_new_tokens: int,
     device: Optional[str],
+    label: str,
+    retry_empty_translations: int = 2,
 ) -> List[str]:
-    return TRANSLATOR_REGISTRY[translator](texts, model_name, use_terminology, max_new_tokens, device)
+    texts = list(texts)
+    outputs = _run_translator(texts, translator, model_name, use_terminology, max_new_tokens, device, label)
+
+    for _ in range(max(0, retry_empty_translations)):
+        bad = _empty_translation_indices(texts, outputs)
+        if not bad:
+            break
+        retry_texts = [texts[i] for i in bad]
+        retry_outputs = _run_translator(
+            retry_texts,
+            translator,
+            model_name,
+            use_terminology,
+            max_new_tokens,
+            device,
+            label,
+        )
+        for i, value in zip(bad, retry_outputs):
+            outputs[i] = value
+
+    bad = _empty_translation_indices(texts, outputs)
+    if bad:
+        fallback_texts = [texts[i] for i in bad]
+        fallback_outputs = _run_translator(
+            fallback_texts,
+            translator,
+            model_name,
+            not use_terminology,
+            max_new_tokens,
+            device,
+            f"{label}/fallback_terms_{str(not use_terminology).lower()}",
+        )
+        for i, value in zip(bad, fallback_outputs):
+            outputs[i] = value
+
+    bad = _empty_translation_indices(texts, outputs)
+    if bad:
+        raise ValueError(
+            f"Translator {translator} produced empty translations in {label} "
+            f"for row indices: {bad[:20]}"
+        )
+
+    return outputs
 
 
 def _translate_one_translator_columns(
@@ -320,27 +389,64 @@ def _translate_one_translator_columns(
     model_name: str,
     max_new_tokens: int,
     device: Optional[str],
+    retry_empty_translations: int = 2,
 ) -> Dict[str, List[str]]:
     result: Dict[str, List[str]] = {}
     candidate_texts = df[CANDIDATE_COL].map(normalize_source_text).tolist()
     reference_texts = df[REFERENCE_COL].map(normalize_source_text).tolist()
 
+    for kind in kinds:
+        if kind not in {"terms", "noterms"}:
+            raise ValueError(f"Unknown translation kind: {kind}")
+
     if translator == "translategemma":
-        cand = _translate_pair_lists(candidate_texts, translator, model_name, False, max_new_tokens, device)
-        ref = _translate_pair_lists(reference_texts, translator, model_name, False, max_new_tokens, device)
+        cand = _translate_pair_lists(
+            candidate_texts,
+            translator,
+            model_name,
+            False,
+            max_new_tokens,
+            device,
+            f"{translator}/generation/noterms",
+            retry_empty_translations,
+        )
+        ref = _translate_pair_lists(
+            reference_texts,
+            translator,
+            model_name,
+            False,
+            max_new_tokens,
+            device,
+            f"{translator}/gt/noterms",
+            retry_empty_translations,
+        )
         for kind in kinds:
-            if kind not in {"terms", "noterms"}:
-                raise ValueError(f"Unknown translation kind: {kind}")
             result[f"generation_{translator}_{kind}"] = cand
             result[f"gt_{translator}_{kind}"] = ref
         return result
 
     for kind in kinds:
-        if kind not in {"terms", "noterms"}:
-            raise ValueError(f"Unknown translation kind: {kind}")
         use_terms = kind == "terms"
-        result[f"generation_{translator}_{kind}"] = _translate_pair_lists(candidate_texts, translator, model_name, use_terms, max_new_tokens, device)
-        result[f"gt_{translator}_{kind}"] = _translate_pair_lists(reference_texts, translator, model_name, use_terms, max_new_tokens, device)
+        result[f"generation_{translator}_{kind}"] = _translate_pair_lists(
+            candidate_texts,
+            translator,
+            model_name,
+            use_terms,
+            max_new_tokens,
+            device,
+            f"{translator}/generation/{kind}",
+            retry_empty_translations,
+        )
+        result[f"gt_{translator}_{kind}"] = _translate_pair_lists(
+            reference_texts,
+            translator,
+            model_name,
+            use_terms,
+            max_new_tokens,
+            device,
+            f"{translator}/gt/{kind}",
+            retry_empty_translations,
+        )
     return result
 
 
@@ -357,6 +463,7 @@ def _translate_one_translator_worker(payload: Dict[str, Any], out_queue: mp.Queu
             model_name=payload["model_name"],
             max_new_tokens=payload["max_new_tokens"],
             device=payload.get("device"),
+            retry_empty_translations=payload.get("retry_empty_translations", 2),
         )
         out = pd.DataFrame({ROW_ID_COL: df[ROW_ID_COL]})
         for k, v in cols.items():
@@ -366,7 +473,6 @@ def _translate_one_translator_worker(payload: Dict[str, Any], out_queue: mp.Queu
         out_queue.put({"ok": True, "out_csv": out_csv})
     except Exception:
         out_queue.put({"ok": False, "error": traceback.format_exc()})
-
 
 def _run_one_translator_in_separate_process(payload: Dict[str, Any], timeout: int) -> pd.DataFrame:
     ctx = mp.get_context("spawn")
@@ -402,6 +508,7 @@ def translate_reports_for_csv(
     device: Optional[str] = None,
     gpu: Optional[int] = None,
     per_translator_timeout: int = 3600,
+    retry_empty_translations: int = 2,
     verbose: bool = False,
 ) -> pd.DataFrame:
     configure_worker_environment(gpu)
@@ -428,6 +535,7 @@ def translate_reports_for_csv(
             "max_new_tokens": max_new_tokens,
             "device": device,
             "gpu": gpu,
+            "retry_empty_translations": retry_empty_translations,
         }
         if verbose:
             print(f"Running translator: {translator}", flush=True)

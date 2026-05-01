@@ -488,8 +488,12 @@ def make_candidate_configs(
 def _quality_feature_matrix(df: pd.DataFrame, specs: Sequence[FeatureSpec]) -> np.ndarray:
     cols = [s.feature_col for s in specs]
     x = df[cols].apply(pd.to_numeric, errors="coerce").to_numpy(dtype=float)
-    signs = np.asarray([1.0 if s.higher_is_better else -1.0 for s in specs], dtype=float)
-    return x * signs
+    result = x.copy()
+    for j, spec in enumerate(specs):
+        if not spec.higher_is_better:
+            col = x[:, j]
+            result[:, j] = np.where(col == 0, 0.0, 1.0 / col)
+    return result
 
 
 def _fit_standardizer(x: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -524,6 +528,9 @@ def _evaluate_config_cv(
     folds: KFold,
     weight_grid: np.ndarray,
 ) -> Tuple[List[float], List[List[float]]]:
+    """
+    evaluate one metric config with cross validation
+    """
     x = _quality_feature_matrix(df, config.features)
     taus: List[float] = []
     weights: List[List[float]] = []
@@ -559,7 +566,7 @@ def select_and_fit_final_config(
     for c in needed_cols:
         work[c] = pd.to_numeric(work[c], errors="coerce")
     before = len(work)
-    work = work.dropna(subset=needed_cols).reset_index(drop=True)
+    work[needed_cols] = work[needed_cols].fillna(0)
     if len(work) < max(2, k_outer, k_inner):
         raise ValueError(f"Not enough complete rows after metric calculation: {len(work)} rows, before={before}")
     target = work[target_col].to_numpy(dtype=float)
